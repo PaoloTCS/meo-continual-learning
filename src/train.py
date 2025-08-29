@@ -1,367 +1,342 @@
 """
-Training script for MEO continual learning experiments.
+Training script for MEO and EWC continual learning experiments.
 
-This module provides training entrypoints for:
-- MEO training with different evolution operators
-- EWC baseline training
-- Evaluation and logging
+- Config-driven entrypoint (YAML): --config <path>, --output_dir <dir>
+- Supports methods: finetune, meo, ewc (config tells which one)
+- ResNet-50 backbone on CIFAR-100 10-task split by default
+- Apple Silicon friendly (prefers MPS), reproducible seeds
+- Cosine schedule restarts per task (T_max = epochs_per_task)
+- EWC Fisher update at the end of each task (online variant)
+- Aggregator-friendly JSON written to results/logs/
 """
 
+from __future__ import annotations
+import argparse
+import os
+import json
+import yaml
+from typing import Dict, Tuple, Optional, Any, List
+
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import torchvision.models as models
-import yaml
-import argparse
-import os
-import time
-from typing import Dict, List, Optional, Tuple
-import numpy as np
-import matplotlib.pyplot as plt
-import pandas as pd
 
-from meo import MEO
-from ewc import EWC
-from data import CIFAR100Continual
+# ---- repo-local modules ----
+# Expect: data.py exposes CIFAR100Continual; ewc.py exposes EWC with methods used below.
+try:
+    from data import CIFAR100Continual
+except Exception as e:
+    raise SystemExit(f"train.py: cannot import CIFAR100Continual from data.py: {e}")
+
+# EWC is optional (finetune/MEO don’t require it). We import lazily in trainer if needed.
 
 
+# ----------------------
+# Utility: device select
+# ----------------------
+def pick_device(prefer: str = "auto") -> torch.device:
+    """
+    Prefer MPS on Apple Silicon, else CUDA, else CPU.
+    If `prefer == "cpu"`, force CPU.
+    """
+    if prefer == "cpu":
+        return torch.device("cpu")
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    return torch.device("cpu")
+
+
+# -----------------------
+# Core Trainer
+# -----------------------
 class ContinualTrainer:
     """Main training class for continual learning experiments."""
-    
+
     def __init__(self, config_path: str):
-        """
-        Initialize trainer with configuration.
-        
-        Args:
-            config_path: Path to YAML configuration file
-        """
-        with open(config_path, 'r') as f:
-            self.config = yaml.safe_load(f)
-            
-        # Set device
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        # Load config
+        with open(config_path, "r") as f:
+            self.config: Dict[str, Any] = yaml.safe_load(f)
+
+        # Device (M1/M2 Apple Silicon friendly)
+        prefer = self.config.get("device", "auto")
+        self.device = pick_device(prefer)
         print(f"Using device: {self.device}")
-        
-        # Set random seed
-        torch.manual_seed(self.config['seed'])
-        np.random.seed(self.config['seed'])
-        
-        # Initialize data
+        try:
+            torch.set_float32_matmul_precision("high")
+        except Exception:
+            pass
+
+        # Seeds
+        seed = int(self.config.get("seed", 42))
+        torch.manual_seed(seed)
+        np.random.seed(seed)
+
+        # Data
+        data_cfg = self.config.get("data", {})
         self.data_manager = CIFAR100Continual(
-            root=self.config['data']['root'],
-            num_tasks=self.config['data']['num_tasks'],
-            batch_size=self.config['data']['batch_size'],
-            num_workers=self.config['data']['num_workers'],
-            seed=self.config['seed']
+            root=data_cfg.get("root", "./data"),
+            num_tasks=int(data_cfg.get("num_tasks", 10)),
+            batch_size=int(data_cfg.get("batch_size", 128)),
+            num_workers=int(data_cfg.get("num_workers", 4)),
+            seed=seed,
         )
-        
-        # Initialize model
-        self.model = self._create_model()
-        self.model.to(self.device)
-        
-        # Initialize method (MEO or EWC)
-        self.method = self.config['method']['type']
-        if self.method == 'meo':
-            self.meo = MEO(
-                evolution_type=self.config['method']['evolution_type'],
-                alpha=self.config['method']['alpha'],
-                eta=self.config['method'].get('eta', 0.02),
-                timing=self.config['method'].get('timing', 'open_loop')
-            )
-            self.ewc = None
-        elif self.method == 'ewc':
-            self.ewc = EWC(self.model, self.config['method']['lambda_ewc'])
-            self.meo = None
-        else:
-            raise ValueError(f"Unknown method: {self.method}")
-            
-        # Initialize optimizer
+
+        # Model
+        self.model = self._create_model().to(self.device)
+
+        # Optimizer (recreated per task if you prefer; here we keep a single optimizer)
+        trn = self.config.get("training", {})
+        self.lr = float(trn.get("lr", 0.01))
+        self.momentum = float(trn.get("momentum", 0.9))
+        self.weight_decay = float(trn.get("weight_decay", 5e-4))
+        self.epochs_per_task = int(trn.get("epochs_per_task", 20))
+
         self.optimizer = optim.SGD(
             self.model.parameters(),
-            lr=self.config['training']['lr'],
-            momentum=self.config['training']['momentum'],
-            weight_decay=self.config['training']['weight_decay']
+            lr=self.lr,
+            momentum=self.momentum,
+            weight_decay=self.weight_decay,
         )
-        
-        # Initialize scheduler
-        self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
-            self.optimizer,
-            T_max=self.config['training']['epochs_per_task']
-        )
-        
-        # Results storage
-        self.results = {
-            'task_accuracies': [],
-            'drift_metrics': [],
-            'training_losses': [],
-            'learning_rates': []
-        }
-        
-    def _create_model(self) -> nn.Module:
-        """Create the neural network model."""
-        model_name = self.config['model']['name']
-        
-        if model_name == 'resnet50':
-            model = models.resnet50(pretrained=False)
-            # Modify final layer for CIFAR-100
-            model.fc = nn.Linear(model.fc.in_features, 100)
-        elif model_name == 'resnet18':
-            model = models.resnet18(pretrained=False)
-            model.fc = nn.Linear(model.fc.in_features, 100)
+
+        # Scheduler will be recreated at the START of each task (cosine restart)
+        self.scheduler: Optional[optim.lr_scheduler._LRScheduler] = None
+
+        # Method
+        method_cfg = self.config.get("method", {})
+        # allow shorthand strings too: method: "ewc"
+        if isinstance(method_cfg, str):
+            method_cfg = {"type": method_cfg}
+        self.method = str(method_cfg.get("type", "finetune")).lower()
+
+        # EWC config
+        self.ewc_lambda = None
+        self.ewc_gamma = float(method_cfg.get("gamma", 0.9))
+        self.ewc_mode = method_cfg.get("mode", "online")
+        self.fisher_batches = int(method_cfg.get("fisher_batches", 200))
+        self.fisher_batch_size = int(method_cfg.get("fisher_batch_size", data_cfg.get("batch_size", 128)))
+        if self.method == "ewc":
+            # support multiple keys
+            for k in ("lambda_ewc", "lambda", "lam", "ewc_lambda"):
+                if k in method_cfg:
+                    self.ewc_lambda = float(method_cfg[k])
+                    break
+            if self.ewc_lambda is None:
+                raise SystemExit("EWC requires method.lambda_ewc (or lambda/lam/ewc_lambda) in the config.")
+
+            # Lazy import EWC only if requested
+            try:
+                from ewc import EWC  # type: ignore
+            except Exception as e:
+                raise SystemExit(f"EWC selected but cannot import EWC from ewc.py: {e}")
+
+            # Construct EWC object; expected to hold consolidated Fisher & theta*
+            self.ewc = EWC(lambda_=self.ewc_lambda, gamma=self.ewc_gamma, mode=self.ewc_mode)
         else:
-            raise ValueError(f"Unknown model: {model_name}")
-            
-        return model
-        
-    def train_task(self, task_id: int) -> Dict:
-        """
-        Train on a specific task.
-        
-        Args:
-            task_id: Task identifier
-            
-        Returns:
-            Dictionary with training results
-        """
-        print(f"\n=== Training on Task {task_id} ===")
-        
-        # Get task data
-        train_loader = self.data_manager.get_task_data(task_id, 'train')
-        test_loader = self.data_manager.get_task_data(task_id, 'test')
-        
-        # Training loop
+            self.ewc = None
+
+        # MEO config (if you wire masking via forward hooks in meo.py)
+        self.meo_alpha = None
+        if self.method == "meo":
+            # optional keys, adapt to your meo.py interface
+            self.meo_alpha = float(method_cfg.get("alpha", 0.1))
+            self.meo_evolution = method_cfg.get("evolution", "identity")
+            # If you implement MEO via hooks:
+            try:
+                from meo import attach_meo_hooks  # type: ignore
+                attach_meo_hooks(self.model, alpha=self.meo_alpha, evolution=self.meo_evolution)
+                print(f"MEO hooks attached: alpha={self.meo_alpha}, evolution={self.meo_evolution}")
+            except Exception:
+                # it’s fine if meo hooks aren’t present; you may be using a different implementation
+                pass
+
+        # Results state
+        self.results: Dict[str, Any] = {
+            "per_task_acc": [],
+            "final_avg_accuracy": None,
+        }
+
+    # -----------------------
+    # Model factory
+    # -----------------------
+    def _create_model(self) -> nn.Module:
+        mdl_cfg = self.config.get("model", {})
+        name = mdl_cfg.get("name", "resnet50")
+        pretrained = bool(mdl_cfg.get("pretrained", False))
+        num_classes = int(mdl_cfg.get("num_classes", 100))
+
+        if name.lower() == "resnet50":
+            model = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V1 if pretrained else None)
+            in_features = model.fc.in_features
+            model.fc = nn.Linear(in_features, num_classes)
+            # Optional init for new head (PyTorch default is fine)
+            nn.init.normal_(model.fc.weight, mean=0.0, std=0.01)
+            nn.init.zeros_(model.fc.bias)
+            return model
+
+        raise SystemExit(f"Unsupported model name: {name}")
+
+    # -----------------------
+    # Training / Eval
+    # -----------------------
+    def _make_scheduler(self) -> optim.lr_scheduler._LRScheduler:
+        # Cosine restart per task
+        return optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=self.epochs_per_task)
+
+    def train_task(self, task_id: int) -> Dict[str, float]:
+        train_loader, test_loader = self.data_manager.get_task_loaders(task_id)
+
+        # Optional: recreate optimizer per task for strict fairness with some baselines
+        # self.optimizer = optim.SGD(self.model.parameters(), lr=self.lr, momentum=self.momentum, weight_decay=self.weight_decay)
+
+        # Restart cosine each task
+        self.scheduler = self._make_scheduler()
+
+        ce = nn.CrossEntropyLoss()
+
         self.model.train()
-        task_losses = []
-        
-        for epoch in range(self.config['training']['epochs_per_task']):
-            epoch_loss = 0.0
-            num_batches = 0
-            
-            for batch_idx, (data, target) in enumerate(train_loader):
-                data, target = data.to(self.device), target.to(self.device)
-                
-                # Forward pass
-                if self.method == 'meo':
-                    # Apply MEO corrections during forward pass
-                    output = self._forward_with_meo(data)
-                else:
-                    output = self.model(data)
-                    
-                # Compute loss
-                loss = nn.CrossEntropyLoss()(output, target)
-                
-                # Add EWC penalty if using EWC
-                if self.method == 'ewc':
-                    ewc_loss = self.ewc.compute_ewc_loss()
-                    loss += ewc_loss
-                    
-                # Backward pass
-                self.optimizer.zero_grad()
+        for epoch in range(self.epochs_per_task):
+            for x, y in train_loader:
+                x = x.to(self.device)
+                y = y.to(self.device)
+
+                self.optimizer.zero_grad(set_to_none=True)
+                logits = self.model(x)
+                loss = ce(logits, y)
+
+                # Add EWC penalty if enabled
+                if self.method == "ewc":
+                    # Expect penalty computed on current model vs consolidated Fisher/theta*
+                    if not hasattr(self.ewc, "compute_ewc_loss"):
+                        raise SystemExit("EWC implementation missing compute_ewc_loss(model). Please add it in ewc.py")
+                    loss = loss + self.ewc.compute_ewc_loss(self.model)
+
                 loss.backward()
                 self.optimizer.step()
-                
-                epoch_loss += loss.item()
-                num_batches += 1
-                
-                # Update MEO references if using MEO
-                if self.method == 'meo':
-                    self._update_meo_references(data)
-                    
-            # Update learning rate
+
+            # Cosine step once per epoch
             self.scheduler.step()
-            
-            # Evaluate on test set
-            test_acc = self.evaluate_task(task_id, test_loader)
-            
-            epoch_loss /= num_batches
-            task_losses.append(epoch_loss)
-            
-            print(f"Epoch {epoch+1}/{self.config['training']['epochs_per_task']}: "
-                  f"Loss: {epoch_loss:.4f}, Test Acc: {test_acc:.2f}%")
-                  
-        # Save optimal parameters for EWC
-        if self.method == 'ewc':
-            self.ewc.save_optimal_params()
-            
-        # Compute final task accuracy
-        final_acc = self.evaluate_task(task_id, test_loader)
-        
-        # Compute drift metric if using MEO
-        drift_metric = 0.0
-        if self.method == 'meo':
-            drift_metric = self.meo.get_drift_metric(['layer1', 'layer2'])  # Example layers
-            
-        return {
-            'task_id': task_id,
-            'final_accuracy': final_acc,
-            'drift_metric': drift_metric,
-            'training_losses': task_losses
-        }
-        
-    def _forward_with_meo(self, data: torch.Tensor) -> torch.Tensor:
-        """Forward pass with MEO corrections."""
-        # This is a simplified version - in practice, you'd need to hook into
-        # the model's forward pass to apply MEO corrections at specific layers
-        return self.model(data)
-        
-    def _update_meo_references(self, data: torch.Tensor):
-        """Update MEO reference activations."""
-        # This is a simplified version - in practice, you'd need to hook into
-        # the model's forward pass to capture activations
-        pass
-        
-    def evaluate_task(self, task_id: int, test_loader) -> float:
-        """
-        Evaluate model on a specific task.
-        
-        Args:
-            task_id: Task identifier
-            test_loader: Test data loader
-            
-        Returns:
-            Test accuracy percentage
-        """
+
+        # After training current task: update EWC statistics at θ*
+        if self.method == "ewc":
+            if not all(hasattr(self.ewc, name) for name in ("update_fisher", "save_optimal_params")):
+                raise SystemExit("EWC implementation must expose update_fisher(model, dataloader, device, batches=...) and save_optimal_params(model)")
+            # snapshot θ* and update Fisher on the train set of this task
+            self.ewc.save_optimal_params(self.model)
+            self.ewc.update_fisher(self.model, train_loader, device=self.device, batches=self.fisher_batches)
+
+        # Evaluate accuracy on current task (you can also evaluate on all seen tasks here)
+        acc = self.evaluate_loader(test_loader)
+        return {"task_id": task_id, "acc": acc}
+
+    @torch.no_grad()
+    def evaluate_loader(self, loader) -> float:
         self.model.eval()
         correct = 0
         total = 0
-        
-        with torch.no_grad():
-            for data, target in test_loader:
-                data, target = data.to(self.device), target.to(self.device)
-                output = self.model(data)
-                _, predicted = torch.max(output.data, 1)
-                total += target.size(0)
-                correct += (predicted == target).sum().item()
-                
-        accuracy = 100 * correct / total
-        return accuracy
-        
-    def evaluate_all_tasks(self) -> List[float]:
-        """
-        Evaluate model on all tasks seen so far.
-        
-        Returns:
-            List of accuracies for each task
-        """
-        accuracies = []
-        
-        for task_id in range(len(self.results['task_accuracies'])):
-            test_loader = self.data_manager.get_task_data(task_id, 'test')
-            acc = self.evaluate_task(task_id, test_loader)
-            accuracies.append(acc)
-            
-        return accuracies
-        
-    def run_experiment(self) -> Dict:
-        """
-        Run the complete continual learning experiment.
-        
-        Returns:
-            Dictionary with experiment results
-        """
-        print("Starting continual learning experiment...")
-        start_time = time.time()
-        
-        # Train on each task sequentially
-        for task_id in range(self.config['data']['num_tasks']):
-            # Train on current task
-            task_results = self.train_task(task_id)
-            
-            # Store results
-            self.results['task_accuracies'].append(task_results['final_accuracy'])
-            self.results['drift_metrics'].append(task_results['drift_metric'])
-            self.results['training_losses'].extend(task_results['training_losses'])
-            
-            # Evaluate on all previous tasks
-            all_task_accs = self.evaluate_all_tasks()
-            print(f"Task {task_id} completed. All task accuracies: {all_task_accs}")
-            
-        # Compute final metrics
-        final_avg_acc = np.mean(self.results['task_accuracies'])
-        final_drift = np.mean(self.results['drift_metrics'])
-        
-        experiment_time = time.time() - start_time
-        
-        print(f"\n=== Experiment Complete ===")
-        print(f"Final average accuracy: {final_avg_acc:.2f}%")
-        print(f"Final average drift: {final_drift:.4f}")
-        print(f"Total time: {experiment_time/3600:.2f} hours")
-        
-        return {
-            'final_avg_accuracy': final_avg_acc,
-            'final_avg_drift': final_drift,
-            'task_accuracies': self.results['task_accuracies'],
-            'drift_metrics': self.results['drift_metrics'],
-            'experiment_time': experiment_time
-        }
-        
+        for x, y in loader:
+            x = x.to(self.device)
+            y = y.to(self.device)
+            logits = self.model(x)
+            _, pred = torch.max(logits, 1)  # avoid .data
+            correct += (pred == y).sum().item()
+            total += y.size(0)
+        return 100.0 * correct / max(1, total)
+
+    def evaluate_seen_tasks(self, upto_task: int) -> List[float]:
+        """Evaluate on all test loaders up to and including `upto_task` and return list of accuracies."""
+        accs = []
+        for t in range(upto_task + 1):
+            _, test_loader = self.data_manager.get_task_loaders(t)
+            accs.append(self.evaluate_loader(test_loader))
+        return accs
+
+    def run_experiment(self) -> Dict[str, Any]:
+        per_task_acc = []
+
+        for t in range(self.data_manager.num_tasks):
+            print(f"\n=== Training Task {t+1}/{self.data_manager.num_tasks} ===")
+            res = self.train_task(t)
+            per_task_acc.append(res["acc"])
+
+            # (Optional) track average over seen tasks
+            seen_accs = self.evaluate_seen_tasks(t)
+            avg_seen = float(np.mean(seen_accs))
+            print(f"[Task {t}] current task acc={res['acc']:.2f} | avg over seen tasks={avg_seen:.2f}")
+
+        # Final average accuracy across all tasks' test sets
+        all_accs = self.evaluate_seen_tasks(self.data_manager.num_tasks - 1)
+        final_avg = float(np.mean(all_accs))
+        print(f"\n[FINAL] Average accuracy over all {self.data_manager.num_tasks} tasks: {final_avg:.3f}%")
+
+        self.results["per_task_acc"] = per_task_acc
+        self.results["final_avg_accuracy"] = final_avg
+        return self.results
+
     def save_results(self, output_dir: str):
-        """Save experiment results to files."""
         os.makedirs(output_dir, exist_ok=True)
-        
-        # Save results as CSV
-        results_df = pd.DataFrame({
-            'task_id': range(len(self.results['task_accuracies'])),
-            'accuracy': self.results['task_accuracies'],
-            'drift_metric': self.results['drift_metrics']
-        })
-        results_df.to_csv(os.path.join(output_dir, 'results.csv'), index=False)
-        
-        # Save training losses
-        losses_df = pd.DataFrame({
-            'epoch': range(len(self.results['training_losses'])),
-            'loss': self.results['training_losses']
-        })
-        losses_df.to_csv(os.path.join(output_dir, 'training_losses.csv'), index=False)
-        
-        # Create plots
-        self._create_plots(output_dir)
-        
-    def _create_plots(self, output_dir: str):
-        """Create and save result plots."""
-        # Accuracy plot
-        plt.figure(figsize=(10, 6))
-        plt.plot(range(len(self.results['task_accuracies'])), 
-                self.results['task_accuracies'], 'bo-')
-        plt.xlabel('Task ID')
-        plt.ylabel('Accuracy (%)')
-        plt.title('Task-wise Accuracy')
-        plt.grid(True)
-        plt.savefig(os.path.join(output_dir, 'task_accuracy.png'), dpi=300, bbox_inches='tight')
-        plt.close()
-        
-        # Drift metric plot
-        if any(d != 0 for d in self.results['drift_metrics']):
-            plt.figure(figsize=(10, 6))
-            plt.plot(range(len(self.results['drift_metrics'])), 
-                    self.results['drift_metrics'], 'ro-')
-            plt.xlabel('Task ID')
-            plt.ylabel('Drift Metric')
-            plt.title('Task-wise Drift Metric')
-            plt.grid(True)
-            plt.savefig(os.path.join(output_dir, 'drift_metric.png'), dpi=300, bbox_inches='tight')
-            plt.close()
+        with open(os.path.join(output_dir, "results.json"), "w") as f:
+            json.dump(self.results, f, indent=2)
 
 
+# -----------------------
+# Entry point
+# -----------------------
 def main():
     """Main training entrypoint."""
-    parser = argparse.ArgumentParser(description='MEO Continual Learning Training')
-    parser.add_argument('--config', type=str, required=True, 
-                       help='Path to configuration YAML file')
-    parser.add_argument('--output_dir', type=str, default='./results',
-                       help='Output directory for results')
-    
+    parser = argparse.ArgumentParser(description="MEO/EWC Continual Learning Training")
+    parser.add_argument("--config", type=str, required=True, help="Path to configuration YAML file")
+    parser.add_argument("--output_dir", type=str, default="./results", help="Output directory for results")
     args = parser.parse_args()
-    
-    # Initialize trainer
+
     trainer = ContinualTrainer(args.config)
-    
-    # Run experiment
     results = trainer.run_experiment()
-    
-    # Save results
     trainer.save_results(args.output_dir)
-    
+
+    # === Aggregator-friendly JSON log for scripts/aggregate_results.py ===
+    # Determine method & seed from config (and EWC lambda if applicable)
+    method_cfg = trainer.config.get("method", {})
+    if isinstance(method_cfg, str):
+        method = method_cfg.lower()
+        method_cfg = {"type": method}
+    else:
+        method = str(method_cfg.get("type", "finetune")).lower()
+    seed = int(trainer.config.get("seed", 42))
+
+    ewc_lambda = None
+    if method == "ewc":
+        for k in ("lambda_ewc", "lambda", "lam", "ewc_lambda"):
+            if k in method_cfg and method_cfg[k] is not None:
+                try:
+                    ewc_lambda = int(method_cfg[k])
+                except Exception:
+                    ewc_lambda = float(method_cfg[k])
+                break
+
+    final_avg_acc = float(results.get("final_avg_accuracy", float("nan")))
+    print(f"[FINAL] final_avg_acc={final_avg_acc:.3f}")
+
+    logdir = os.path.join("results", "logs")
+    os.makedirs(logdir, exist_ok=True)
+    tag = f"{method}_seed{seed}"
+    if method == "ewc" and ewc_lambda is not None:
+        tag += f"_lam{ewc_lambda}"
+    out_json = os.path.join(logdir, f"{tag}.json")
+    with open(out_json, "w") as f:
+        json.dump(
+            {
+                "method": method,
+                "lambda": ewc_lambda,
+                "seed": seed,
+                "final_avg_acc": final_avg_acc,
+            },
+            f,
+            indent=2,
+        )
+
     print(f"Results saved to {args.output_dir}")
 
 

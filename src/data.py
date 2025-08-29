@@ -150,6 +150,20 @@ class CIFAR100Continual:
         
         return dataloader
         
+    def get_task_loaders(self, task_id: int) -> Tuple[DataLoader, DataLoader]:
+        """
+        Get train and test loaders for a specific task.
+        
+        Args:
+            task_id: Task identifier (0 to num_tasks-1)
+            
+        Returns:
+            Tuple of (train_loader, test_loader)
+        """
+        train_loader = self.get_task_data(task_id, 'train')
+        test_loader = self.get_task_data(task_id, 'test')
+        return train_loader, test_loader
+        
     def get_all_tasks_data(self, split: str = 'train') -> Dict[int, DataLoader]:
         """
         Get data for all tasks.
