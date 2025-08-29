@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.pyc
+
+# LaTeX
+*.aux
+*.log
+*.out
+*.toc
+*.lof
+*.lot
+*.fls
+*.fdb_latexmk
+*.synctex*
+
+# Jupyter + results
+.ipynb_checkpoints/
+results/

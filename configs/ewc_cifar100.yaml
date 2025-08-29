@@ -1,0 +1,58 @@
+# EWC Configuration for CIFAR-100 Continual Learning
+# This configuration file controls all hyperparameters for EWC baseline training
+
+# Random seed for reproducibility
+seed: 42
+
+# Model configuration
+model:
+  name: "resnet50"  # Options: resnet18, resnet50
+  pretrained: false
+
+# Data configuration
+data:
+  root: "./data"           # Data directory
+  num_tasks: 10            # Number of continual learning tasks
+  batch_size: 128          # Training batch size
+  num_workers: 4           # Data loading workers
+  download: true           # Download CIFAR-100 if not present
+
+# EWC method configuration
+method:
+  type: "ewc"              # Method type: meo, ewc, finetune
+  lambda_ewc: 100.0        # EWC regularization strength
+  fisher_samples: 1000     # Number of samples for Fisher estimation
+  fisher_update_freq: 1    # Update Fisher info every N tasks
+
+# Training configuration
+training:
+  epochs_per_task: 20      # Number of epochs per task
+  lr: 0.01                 # Initial learning rate
+  momentum: 0.9            # SGD momentum
+  weight_decay: 5e-4       # Weight decay
+  scheduler: "cosine"      # Learning rate scheduler: cosine, step, constant
+  
+# Evaluation configuration
+evaluation:
+  eval_frequency: 1        # Evaluate every N epochs
+  save_checkpoints: true   # Save model checkpoints
+  checkpoint_frequency: 5  # Save checkpoint every N epochs
+  
+# Logging and output
+logging:
+  log_frequency: 100       # Log every N batches
+  save_fisher: false       # Save Fisher information matrices
+  tensorboard: false       # Enable TensorBoard logging
+  
+# Hardware configuration
+hardware:
+  device: "auto"           # Device: auto, cuda, cpu
+  mixed_precision: false   # Enable mixed precision training
+  num_gpus: 1              # Number of GPUs to use
+  
+# Results and output
+output:
+  results_dir: "./results"  # Results output directory
+  save_plots: true         # Save result plots
+  save_csv: true           # Save results as CSV
+  experiment_name: "ewc_cifar100_lambda100"  # Experiment identifier

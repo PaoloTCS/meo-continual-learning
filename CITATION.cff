@@ -1,0 +1,20 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+authors:
+  - family-names: "Pignatelli di Montecalvo"
+    given-names: "Paolo"
+    orcid: "https://orcid.org/0000-0000-0000-0000"
+title: "MEO: Mask Evolution Operators for Continual Learning Stability"
+version: 1.0.0
+doi: 10.5281/zenodo.0000000
+date-released: 2025-01-28
+url: "https://github.com/PaoloTCS/meo-continual-learning"
+repository-code: "https://github.com/PaoloTCS/meo-continual-learning"
+license: MIT
+keywords:
+  - "continual learning"
+  - "catastrophic forgetting"
+  - "activation-space"
+  - "mask evolution operators"
+  - "deep learning"
+  - "neural networks"
