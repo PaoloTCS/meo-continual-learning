@@ -68,3 +68,4 @@ setup(
         "Documentation": "https://github.com/PaoloTCS/meo-continual-learning#readme",
     },
 )
+

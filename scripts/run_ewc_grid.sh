@@ -49,7 +49,7 @@ device: "mps"
 EOF
     
     # Run training
-    python src/train.py \
+    python -m src.train \
         --config configs/ewc_lambda_${lambda}.yaml \
         --output_dir results/ewc_lambda_${lambda}
     

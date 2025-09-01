@@ -26,9 +26,9 @@ import torchvision.models as models
 # ---- repo-local modules ----
 # Expect: data.py exposes CIFAR100Continual; ewc.py exposes EWC with methods used below.
 try:
-    from data import CIFAR100Continual
+    from src.data import CIFAR100Continual
 except Exception as e:
-    raise SystemExit(f"train.py: cannot import CIFAR100Continual from data.py: {e}")
+    raise SystemExit(f"train.py: cannot import CIFAR100Continual from src.data: {e}")
 
 # EWC is optional (finetune/MEO don’t require it). We import lazily in trainer if needed.
 
@@ -129,9 +129,9 @@ class ContinualTrainer:
 
             # Lazy import EWC only if requested
             try:
-                from ewc import EWC  # type: ignore
+                from src.ewc import EWC  # type: ignore
             except Exception as e:
-                raise SystemExit(f"EWC selected but cannot import EWC from ewc.py: {e}")
+                raise SystemExit(f"EWC selected but cannot import EWC from src.ewc: {e}")
 
             # Construct EWC object; expected to hold consolidated Fisher & theta*
             self.ewc = EWC(lambda_=self.ewc_lambda, gamma=self.ewc_gamma, mode=self.ewc_mode)
@@ -146,7 +146,7 @@ class ContinualTrainer:
             self.meo_evolution = method_cfg.get("evolution", "identity")
             # If you implement MEO via hooks:
             try:
-                from meo import attach_meo_hooks  # type: ignore
+                from src.meo import attach_meo_hooks  # type: ignore
                 attach_meo_hooks(self.model, alpha=self.meo_alpha, evolution=self.meo_evolution)
                 print(f"MEO hooks attached: alpha={self.meo_alpha}, evolution={self.meo_evolution}")
             except Exception:

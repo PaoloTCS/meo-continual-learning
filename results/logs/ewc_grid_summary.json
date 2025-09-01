@@ -1,0 +1,12 @@
+{
+  "best_lambda": 50,
+  "best_final_avg_acc": 3.31,
+  "all_results": [
+    {
+      "method": "ewc",
+      "lambda": 50,
+      "seed": 42,
+      "final_avg_acc": 3.31
+    }
+  ]
+}

@@ -1,0 +1,25 @@
+# Simple test configuration for basic functionality testing
+seed: 42
+model:
+  name: "resnet50"
+  pretrained: false
+  num_classes: 100
+
+data:
+  root: "./data"
+  num_tasks: 2  # Reduced for testing
+  batch_size: 32  # Smaller batch size for testing
+  num_workers: 2
+
+method:
+  type: "finetune"  # Start with simple finetune
+
+training:
+  epochs_per_task: 2  # Very few epochs for testing
+  lr: 0.01
+  momentum: 0.9
+  weight_decay: 5e-4
+  scheduler: "cosine"
+
+device: "cpu"  # Use CPU for initial testing
+

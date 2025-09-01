@@ -29,3 +29,4 @@ __all__ = [
     "CIFAR100Continual",
     "ContinualTrainer"
 ]
+

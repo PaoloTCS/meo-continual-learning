@@ -1,6 +1,7 @@
 # Python
 __pycache__/
 *.pyc
+.venv/
 
 # LaTeX
 *.aux
@@ -15,4 +16,14 @@ __pycache__/
 
 # Jupyter + results
 .ipynb_checkpoints/
-results/
+
+# Ignore bulky results by default, but keep JSON summaries
+results/*
+!results/**/*.json
+!results/**/results.json
+!results/logs/
+!results/logs/*.json
+
+# Datasets and large local data
+data/
+
