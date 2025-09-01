@@ -1,0 +1,18 @@
+data:
+  batch_size: 128
+  num_tasks: 2
+  num_workers: 2
+  root: ./data
+device: auto
+method:
+  type: finetune
+model:
+  name: resnet50
+  num_classes: 100
+  pretrained: false
+seed: 42
+training:
+  epochs_per_task: 5
+  lr: 0.01
+  momentum: 0.9
+  weight_decay: 0.0005

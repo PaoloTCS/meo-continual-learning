@@ -147,7 +147,9 @@ class ContinualTrainer:
             # If you implement MEO via hooks:
             try:
                 from src.meo import attach_meo_hooks  # type: ignore
-                attach_meo_hooks(self.model, alpha=self.meo_alpha, evolution=self.meo_evolution)
+                meo_attach = attach_meo_hooks(self.model, alpha=self.meo_alpha, evolution=self.meo_evolution)
+                self._meo_obj = meo_attach["meo"]
+                self._meo_layers = meo_attach["layer_names"]
                 print(f"MEO hooks attached: alpha={self.meo_alpha}, evolution={self.meo_evolution}")
             except Exception:
                 # it’s fine if meo hooks aren’t present; you may be using a different implementation
@@ -157,6 +159,7 @@ class ContinualTrainer:
         self.results: Dict[str, Any] = {
             "per_task_acc": [],
             "final_avg_accuracy": None,
+            "drift": {"per_epoch": [], "per_task": []},
         }
 
     # -----------------------
@@ -220,6 +223,14 @@ class ContinualTrainer:
             # Cosine step once per epoch
             self.scheduler.step()
 
+            # MEO drift metric per epoch
+            if self.method == "meo" and hasattr(self, "_meo_obj"):
+                try:
+                    drift_value = float(self._meo_obj.get_drift_metric(getattr(self, "_meo_layers", [])))
+                    self.results["drift"]["per_epoch"].append({"task": task_id, "epoch": epoch, "drift": drift_value})
+                except Exception:
+                    pass
+
         # After training current task: update EWC statistics at θ*
         if self.method == "ewc":
             if not all(hasattr(self.ewc, name) for name in ("update_fisher", "save_optimal_params")):
@@ -230,6 +241,14 @@ class ContinualTrainer:
 
         # Evaluate accuracy on current task (you can also evaluate on all seen tasks here)
         acc = self.evaluate_loader(test_loader)
+
+        # Drift per task end
+        if self.method == "meo" and hasattr(self, "_meo_obj"):
+            try:
+                drift_value = float(self._meo_obj.get_drift_metric(getattr(self, "_meo_layers", [])))
+                self.results["drift"]["per_task"].append({"task": task_id, "drift": drift_value})
+            except Exception:
+                pass
         return {"task_id": task_id, "acc": acc}
 
     @torch.no_grad()
@@ -280,6 +299,10 @@ class ContinualTrainer:
         os.makedirs(output_dir, exist_ok=True)
         with open(os.path.join(output_dir, "results.json"), "w") as f:
             json.dump(self.results, f, indent=2)
+        # If drift exists, save separately for plotting
+        if "drift" in self.results:
+            with open(os.path.join(output_dir, "drift.json"), "w") as f:
+                json.dump(self.results["drift"], f, indent=2)
 
 
 # -----------------------

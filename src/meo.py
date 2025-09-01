@@ -40,22 +40,26 @@ class IdentityOperator(MaskEvolutionOperator):
     """Identity evolution operator - maximal rigidity stress test."""
     
     def update_reference(self, layer_name: str, activations: torch.Tensor):
-        """Keep reference unchanged (identity operation)."""
+        """Keep reference as first batch mean (identity operation)."""
         if layer_name not in self.references:
-            self.references[layer_name] = activations.detach().clone()
-        # Identity: do nothing to reference
+            # Store per-channel/spatial mean so it is batch-size invariant
+            ref = activations.detach().mean(dim=0, keepdim=True)
+            self.references[layer_name] = ref
+        # Identity: do nothing to reference afterwards
         
     def compute_mask(self, layer_name: str, activations: torch.Tensor) -> torch.Tensor:
-        """Compute mask based on deviation from fixed reference."""
+        """Compute broadcastable mask based on deviation from fixed reference."""
         if layer_name not in self.references:
             return torch.zeros_like(activations)
-            
-        error = activations - self.references[layer_name]
-        # Normalize per-channel for stability
+
+        # Use batch mean so mask has shape (1, C, H, W) and broadcasts to any batch
+        ref = self.references[layer_name]
+        cur = activations.mean(dim=0, keepdim=True)
+        error = cur - ref
         if error.dim() > 1:
-            std = error.std(dim=0, keepdim=True)
+            std = error.std(dim=list(range(1, error.dim())), keepdim=True)
             error = error / (std + 1e-8)
-            
+
         return self.alpha * error
 
 
@@ -86,16 +90,17 @@ class EMAOperator(MaskEvolutionOperator):
             )
             
     def compute_mask(self, layer_name: str, activations: torch.Tensor) -> torch.Tensor:
-        """Compute mask based on deviation from evolving reference."""
+        """Compute broadcastable mask based on deviation from evolving reference."""
         if layer_name not in self.references:
             return torch.zeros_like(activations)
-            
-        error = activations - self.references[layer_name]
-        # Normalize per-channel for stability
+
+        ref = self.references[layer_name]
+        cur = activations.mean(dim=0, keepdim=True)
+        error = cur - ref
         if error.dim() > 1:
-            std = error.std(dim=0, keepdim=True)
+            std = error.std(dim=list(range(1, error.dim())), keepdim=True)
             error = error / (std + 1e-8)
-            
+
         return self.alpha * error
 
 
@@ -139,29 +144,30 @@ class MEO(nn.Module):
         Returns:
             Corrected activations
         """
-        if self.timing == 'open_loop':
-            # Apply previous mask, then compute new one
-            if layer_name in self.masks:
-                corrected = activations - self.masks[layer_name]
-            else:
-                corrected = activations
-                
-            # Compute new mask from uncorrected activations
-            self.masks[layer_name] = self.evolution_op.compute_mask(
-                layer_name, activations
-            )
-            
-        else:  # closed_loop
-            # Compute mask and apply immediately
-            mask = self.evolution_op.compute_mask(layer_name, activations)
-            corrected = activations - mask
-            self.masks[layer_name] = mask
+        with torch.no_grad():
+            if self.timing == 'open_loop':
+                # Apply previous mask, then compute new one
+                if layer_name in self.masks:
+                    corrected = activations - self.masks[layer_name]
+                else:
+                    corrected = activations
+
+                # Compute new mask from uncorrected activations
+                mask = self.evolution_op.compute_mask(layer_name, activations)
+                self.masks[layer_name] = mask.detach()
+
+            else:  # closed_loop
+                # Compute mask and apply immediately
+                mask = self.evolution_op.compute_mask(layer_name, activations)
+                corrected = activations - mask
+                self.masks[layer_name] = mask.detach()
             
         return corrected
         
     def update_reference(self, layer_name: str, activations: torch.Tensor):
         """Update reference activations for a layer."""
-        self.evolution_op.update_reference(layer_name, activations)
+        with torch.no_grad():
+            self.evolution_op.update_reference(layer_name, activations)
         
     def get_drift_metric(self, layer_names: List[str]) -> float:
         """
@@ -198,19 +204,47 @@ class MEO(nn.Module):
 
 def attach_meo_hooks(model, alpha=0.1, evolution="identity"):
     """
-    Attach MEO hooks to a model for activation-level corrections.
-    
-    Args:
-        model: PyTorch model to attach hooks to
-        alpha: Stiffness parameter
-        evolution: Evolution type ('identity', 'ema', 'subspace')
-    
-    Note: This is a placeholder implementation. In practice, you would
-    implement proper forward hooks to capture and correct activations.
+    Attach MEO hooks to a ResNet model's intermediate layers for activation-level
+    corrections and drift tracking.
+
+    Returns a dictionary containing the constructed MEO object and the list of
+    layer names that have hooks attached.
     """
-    print(f"MEO hooks placeholder: alpha={alpha}, evolution={evolution}")
-    print("Note: This is a placeholder - implement proper hooks for production use")
-    return model
+    meo = MEO(evolution_type=evolution, alpha=alpha)
+
+    # Choose common ResNet blocks to hook
+    candidate_layers = ["layer1", "layer2", "layer3", "layer4"]
+    layer_names = []
+    handles = []
+
+    def make_hook(layer_name: str):
+        def hook(module, inputs, output):
+            # output is a Tensor; compute correction via MEO and optionally
+            # initialize/update references when absent
+            activations = output
+            if layer_name not in meo.evolution_op.references:
+                # Initialize reference on first seen batch for this layer
+                try:
+                    meo.update_reference(layer_name, activations.detach())
+                except Exception:
+                    pass
+            corrected = meo(layer_name, activations)
+            return corrected
+        return hook
+
+    for name in candidate_layers:
+        layer = getattr(model, name, None)
+        if layer is not None:
+            h = layer.register_forward_hook(make_hook(name))
+            handles.append(h)
+            layer_names.append(name)
+
+    # Store for potential cleanup
+    setattr(model, "_meo_handles", handles)
+    setattr(model, "_meo_layer_names", layer_names)
+
+    print(f"MEO hooks attached on layers: {layer_names} | alpha={alpha}, evolution={evolution}")
+    return {"meo": meo, "layer_names": layer_names}
 
 
 # Example usage
