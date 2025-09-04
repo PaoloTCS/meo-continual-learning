@@ -103,3 +103,8 @@ print(out.read_text())
 PY
 
 echo "All done. See results/summary_morning.txt and logs/*.log"
+
+# Optional auto publish
+if [ "${AUTO_PUBLISH:-0}" = "1" ]; then
+  bash scripts/publish_results.sh || true
+fi
