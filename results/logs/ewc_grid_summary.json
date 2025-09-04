@@ -1,12 +1,54 @@
 {
-  "best_lambda": 50,
-  "best_final_avg_acc": 3.31,
+  "best_lambda": 30,
+  "best_final_avg_acc": 6.21,
   "all_results": [
+    {
+      "method": "ewc",
+      "lambda": 0,
+      "seed": 42,
+      "final_avg_acc": 5.61
+    },
+    {
+      "method": "ewc",
+      "lambda": 1,
+      "seed": 42,
+      "final_avg_acc": 5.46
+    },
+    {
+      "method": "ewc",
+      "lambda": 100,
+      "seed": 42,
+      "final_avg_acc": 1.0
+    },
+    {
+      "method": "ewc",
+      "lambda": 30,
+      "seed": 42,
+      "final_avg_acc": 6.21
+    },
+    {
+      "method": "ewc",
+      "lambda": 10,
+      "seed": 42,
+      "final_avg_acc": 4.5
+    },
     {
       "method": "ewc",
       "lambda": 50,
       "seed": 42,
-      "final_avg_acc": 3.31
+      "final_avg_acc": 5.49
+    },
+    {
+      "method": "ewc",
+      "lambda": 3,
+      "seed": 42,
+      "final_avg_acc": 5.720000000000001
+    },
+    {
+      "method": "ewc",
+      "lambda": 200,
+      "seed": 42,
+      "final_avg_acc": 1.0
     }
   ]
 }

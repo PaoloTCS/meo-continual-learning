@@ -2,9 +2,9 @@ seed: 42
 device: auto
 data:
   root: ./data
-  num_tasks: 2
+  num_tasks: 10
   batch_size: 128
-  num_workers: 2
+  num_workers: 0   # M1/MPS: 0 or 1 is usually fastest/quietest
 model:
   name: resnet50
   pretrained: false
@@ -13,6 +13,6 @@ training:
   lr: 0.01
   momentum: 0.9
   weight_decay: 5e-4
-  epochs_per_task: 5
+  epochs_per_task: 20
 method:
   type: finetune

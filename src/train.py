@@ -1,21 +1,19 @@
+# src/train.py
 """
-Training script for MEO and EWC continual learning experiments.
+Training script for MEO / EWC / Finetune continual learning on CIFAR-100.
 
-- Config-driven entrypoint (YAML): --config <path>, --output_dir <dir>
-- Supports methods: finetune, meo, ewc (config tells which one)
-- ResNet-50 backbone on CIFAR-100 10-task split by default
-- Apple Silicon friendly (prefers MPS), reproducible seeds
-- Cosine schedule restarts per task (T_max = epochs_per_task)
-- EWC Fisher update at the end of each task (online variant)
-- Aggregator-friendly JSON written to results/logs/
+- Config-driven: --config <yaml>, --output_dir <dir>
+- Apple Silicon friendly (prefers MPS), falls back to CUDA->CPU
+- Cosine LR restarts **per task** (fixes zero-LR-on-task-2)
+- EWC Fisher update after each task when method == "ewc"
+- Aggregator-friendly JSON logs in results/logs/
 """
 
 from __future__ import annotations
 import argparse
-import os
 import json
-import yaml
-from typing import Dict, Tuple, Optional, Any, List
+import os
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import torch
@@ -23,45 +21,38 @@ import torch.nn as nn
 import torch.optim as optim
 import torchvision.models as models
 
-# ---- repo-local modules ----
-# Expect: data.py exposes CIFAR100Continual; ewc.py exposes EWC with methods used below.
+# Suppress harmless runpy warnings when using -m with multiprocessing
+import warnings as _warnings
+_warnings.filterwarnings("ignore", category=RuntimeWarning, module="runpy")
+
+# ---- repo-local ----
 try:
     from src.data import CIFAR100Continual
 except Exception as e:
     raise SystemExit(f"train.py: cannot import CIFAR100Continual from src.data: {e}")
 
-# EWC is optional (finetune/MEO don’t require it). We import lazily in trainer if needed.
-
-
 # ----------------------
-# Utility: device select
+# Device selection
 # ----------------------
 def pick_device(prefer: str = "auto") -> torch.device:
-    """
-    Prefer MPS on Apple Silicon, else CUDA, else CPU.
-    If `prefer == "cpu"`, force CPU.
-    """
     if prefer == "cpu":
         return torch.device("cpu")
-    if torch.backends.mps.is_available():
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
         return torch.device("mps")
     if torch.cuda.is_available():
         return torch.device("cuda")
     return torch.device("cpu")
 
 
-# -----------------------
-# Core Trainer
-# -----------------------
 class ContinualTrainer:
     """Main training class for continual learning experiments."""
 
     def __init__(self, config_path: str):
-        # Load config
+        import yaml
         with open(config_path, "r") as f:
             self.config: Dict[str, Any] = yaml.safe_load(f)
 
-        # Device (M1/M2 Apple Silicon friendly)
+        # Device
         prefer = self.config.get("device", "auto")
         self.device = pick_device(prefer)
         print(f"Using device: {self.device}")
@@ -70,7 +61,7 @@ class ContinualTrainer:
         except Exception:
             pass
 
-        # Seeds
+        # Seed
         seed = int(self.config.get("seed", 42))
         torch.manual_seed(seed)
         np.random.seed(seed)
@@ -81,33 +72,26 @@ class ContinualTrainer:
             root=data_cfg.get("root", "./data"),
             num_tasks=int(data_cfg.get("num_tasks", 10)),
             batch_size=int(data_cfg.get("batch_size", 128)),
-            num_workers=int(data_cfg.get("num_workers", 4)),
+            num_workers=int(data_cfg.get("num_workers", 2)),
             seed=seed,
         )
 
         # Model
         self.model = self._create_model().to(self.device)
 
-        # Optimizer (recreated per task if you prefer; here we keep a single optimizer)
+        # Train hyperparams
         trn = self.config.get("training", {})
         self.lr = float(trn.get("lr", 0.01))
         self.momentum = float(trn.get("momentum", 0.9))
         self.weight_decay = float(trn.get("weight_decay", 5e-4))
         self.epochs_per_task = int(trn.get("epochs_per_task", 20))
 
-        self.optimizer = optim.SGD(
-            self.model.parameters(),
-            lr=self.lr,
-            momentum=self.momentum,
-            weight_decay=self.weight_decay,
-        )
-
-        # Scheduler will be recreated at the START of each task (cosine restart)
+        # Created per-task (don’t persist across tasks)
+        self.optimizer: Optional[optim.Optimizer] = None
         self.scheduler: Optional[optim.lr_scheduler._LRScheduler] = None
 
         # Method
         method_cfg = self.config.get("method", {})
-        # allow shorthand strings too: method: "ewc"
         if isinstance(method_cfg, str):
             method_cfg = {"type": method_cfg}
         self.method = str(method_cfg.get("type", "finetune")).lower()
@@ -117,45 +101,37 @@ class ContinualTrainer:
         self.ewc_gamma = float(method_cfg.get("gamma", 0.9))
         self.ewc_mode = method_cfg.get("mode", "online")
         self.fisher_batches = int(method_cfg.get("fisher_batches", 200))
-        self.fisher_batch_size = int(method_cfg.get("fisher_batch_size", data_cfg.get("batch_size", 128)))
+        self.fisher_batch_size = int(method_cfg.get("fisher_batch_size", self.config.get("data", {}).get("batch_size", 128)))
         if self.method == "ewc":
-            # support multiple keys
             for k in ("lambda_ewc", "lambda", "lam", "ewc_lambda"):
                 if k in method_cfg:
                     self.ewc_lambda = float(method_cfg[k])
                     break
             if self.ewc_lambda is None:
                 raise SystemExit("EWC requires method.lambda_ewc (or lambda/lam/ewc_lambda) in the config.")
-
-            # Lazy import EWC only if requested
             try:
-                from src.ewc import EWC  # type: ignore
+                from src.ewc import EWC  # your implementation
             except Exception as e:
                 raise SystemExit(f"EWC selected but cannot import EWC from src.ewc: {e}")
-
-            # Construct EWC object; expected to hold consolidated Fisher & theta*
             self.ewc = EWC(lambda_=self.ewc_lambda, gamma=self.ewc_gamma, mode=self.ewc_mode)
         else:
             self.ewc = None
 
-        # MEO config (if you wire masking via forward hooks in meo.py)
-        self.meo_alpha = None
-        if self.method == "meo":
-            # optional keys, adapt to your meo.py interface
-            self.meo_alpha = float(method_cfg.get("alpha", 0.1))
-            self.meo_evolution = method_cfg.get("evolution", "identity")
-            # If you implement MEO via hooks:
-            try:
-                from src.meo import attach_meo_hooks  # type: ignore
-                meo_attach = attach_meo_hooks(self.model, alpha=self.meo_alpha, evolution=self.meo_evolution)
-                self._meo_obj = meo_attach["meo"]
-                self._meo_layers = meo_attach["layer_names"]
+        # Optional MEO hooks (if implemented in src/meo.py)
+        self._meo_obj = None
+        try:
+            if self.method == "meo":
+                self.meo_alpha = float(method_cfg.get("alpha", 0.1))
+                self.meo_evolution = method_cfg.get("evolution", "identity")
+                from src.meo import attach_meo_hooks  # optional
+                attach = attach_meo_hooks(self.model, alpha=self.meo_alpha, evolution=self.meo_evolution)
+                self._meo_obj = attach.get("meo")
+                self._meo_layers = attach.get("layer_names", [])
                 print(f"MEO hooks attached: alpha={self.meo_alpha}, evolution={self.meo_evolution}")
-            except Exception:
-                # it’s fine if meo hooks aren’t present; you may be using a different implementation
-                pass
+        except Exception:
+            pass
 
-        # Results state
+        # Results
         self.results: Dict[str, Any] = {
             "per_task_acc": [],
             "final_avg_accuracy": None,
@@ -166,127 +142,128 @@ class ContinualTrainer:
     # Model factory
     # -----------------------
     def _create_model(self) -> nn.Module:
-        mdl_cfg = self.config.get("model", {})
-        name = mdl_cfg.get("name", "resnet50")
-        pretrained = bool(mdl_cfg.get("pretrained", False))
-        num_classes = int(mdl_cfg.get("num_classes", 100))
+        mdl = self.config.get("model", {})
+        name = str(mdl.get("name", "resnet50")).lower()
+        pretrained = bool(mdl.get("pretrained", False))
+        num_classes = int(mdl.get("num_classes", 100))
 
-        if name.lower() == "resnet50":
-            model = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V1 if pretrained else None)
+        if name == "resnet50":
+            weights = models.ResNet50_Weights.IMAGENET1K_V1 if pretrained else None
+            model = models.resnet50(weights=weights)
             in_features = model.fc.in_features
             model.fc = nn.Linear(in_features, num_classes)
-            # Optional init for new head (PyTorch default is fine)
             nn.init.normal_(model.fc.weight, mean=0.0, std=0.01)
             nn.init.zeros_(model.fc.bias)
             return model
 
-        raise SystemExit(f"Unsupported model name: {name}")
+        raise SystemExit(f"Unsupported model: {name}")
 
     # -----------------------
-    # Training / Eval
+    # Optim/Sched builders
     # -----------------------
+    def _make_optimizer(self) -> optim.Optimizer:
+        for p in self.model.parameters():
+            p.requires_grad = True
+        return optim.SGD(
+            self.model.parameters(),
+            lr=self.lr,
+            momentum=self.momentum,
+            weight_decay=self.weight_decay,
+        )
+
     def _make_scheduler(self) -> optim.lr_scheduler._LRScheduler:
-        # Cosine restart per task
+        # Restart cosine each task
         return optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=self.epochs_per_task)
 
+    # -----------------------
+    # Train / Eval
+    # -----------------------
     def train_task(self, task_id: int) -> Dict[str, float]:
         train_loader, test_loader = self.data_manager.get_task_loaders(task_id)
 
-        # Optional: recreate optimizer per task for strict fairness with some baselines
-        # self.optimizer = optim.SGD(self.model.parameters(), lr=self.lr, momentum=self.momentum, weight_decay=self.weight_decay)
-
-        # Restart cosine each task
+        # (Re)create optimizer & cosine scheduler **per task**
+        self.optimizer = self._make_optimizer()
         self.scheduler = self._make_scheduler()
 
         ce = nn.CrossEntropyLoss()
 
-        self.model.train()
         for epoch in range(self.epochs_per_task):
+            self.model.train()
             for x, y in train_loader:
-                x = x.to(self.device)
-                y = y.to(self.device)
-
+                x, y = x.to(self.device), y.to(self.device)
                 self.optimizer.zero_grad(set_to_none=True)
                 logits = self.model(x)
                 loss = ce(logits, y)
 
-                # Add EWC penalty if enabled
                 if self.method == "ewc":
-                    # Expect penalty computed on current model vs consolidated Fisher/theta*
                     if not hasattr(self.ewc, "compute_ewc_loss"):
-                        raise SystemExit("EWC implementation missing compute_ewc_loss(model). Please add it in ewc.py")
+                        raise SystemExit("EWC implementation missing compute_ewc_loss(model).")
                     loss = loss + self.ewc.compute_ewc_loss(self.model)
 
                 loss.backward()
                 self.optimizer.step()
 
-            # Cosine step once per epoch
             self.scheduler.step()
 
-            # MEO drift metric per epoch
-            if self.method == "meo" and hasattr(self, "_meo_obj"):
+            # Optional: drift metric per epoch for MEO
+            if self.method == "meo" and self._meo_obj is not None:
                 try:
                     drift_value = float(self._meo_obj.get_drift_metric(getattr(self, "_meo_layers", [])))
-                    self.results["drift"]["per_epoch"].append({"task": task_id, "epoch": epoch, "drift": drift_value})
+                    self.results["drift"]["per_epoch"].append(
+                        {"task": task_id, "epoch": epoch, "drift": drift_value}
+                    )
                 except Exception:
                     pass
 
-        # After training current task: update EWC statistics at θ*
+        # EWC consolidation at end of task
         if self.method == "ewc":
-            if not all(hasattr(self.ewc, name) for name in ("update_fisher", "save_optimal_params")):
-                raise SystemExit("EWC implementation must expose update_fisher(model, dataloader, device, batches=...) and save_optimal_params(model)")
-            # snapshot θ* and update Fisher on the train set of this task
+            if not all(hasattr(self.ewc, n) for n in ("save_optimal_params", "update_fisher")):
+                raise SystemExit("EWC must expose save_optimal_params() and update_fisher().")
             self.ewc.save_optimal_params(self.model)
             self.ewc.update_fisher(self.model, train_loader, device=self.device, batches=self.fisher_batches)
 
-        # Evaluate accuracy on current task (you can also evaluate on all seen tasks here)
+        # Evaluate this task’s test set
         acc = self.evaluate_loader(test_loader)
 
-        # Drift per task end
-        if self.method == "meo" and hasattr(self, "_meo_obj"):
+        # Optional: drift per task
+        if self.method == "meo" and self._meo_obj is not None:
             try:
                 drift_value = float(self._meo_obj.get_drift_metric(getattr(self, "_meo_layers", [])))
                 self.results["drift"]["per_task"].append({"task": task_id, "drift": drift_value})
             except Exception:
                 pass
+
         return {"task_id": task_id, "acc": acc}
 
     @torch.no_grad()
     def evaluate_loader(self, loader) -> float:
         self.model.eval()
-        correct = 0
-        total = 0
+        correct = total = 0
         for x, y in loader:
-            x = x.to(self.device)
-            y = y.to(self.device)
-            logits = self.model(x)
-            _, pred = torch.max(logits, 1)  # avoid .data
+            x, y = x.to(self.device), y.to(self.device)
+            pred = self.model(x).argmax(1)
             correct += (pred == y).sum().item()
-            total += y.size(0)
+            total += y.numel()
         return 100.0 * correct / max(1, total)
 
     def evaluate_seen_tasks(self, upto_task: int) -> List[float]:
-        """Evaluate on all test loaders up to and including `upto_task` and return list of accuracies."""
-        accs = []
+        accs: List[float] = []
         for t in range(upto_task + 1):
             _, test_loader = self.data_manager.get_task_loaders(t)
             accs.append(self.evaluate_loader(test_loader))
         return accs
 
     def run_experiment(self) -> Dict[str, Any]:
-        per_task_acc = []
-
+        per_task_acc: List[float] = []
         for t in range(self.data_manager.num_tasks):
             print(f"\n=== Training Task {t+1}/{self.data_manager.num_tasks} ===")
             res = self.train_task(t)
             per_task_acc.append(res["acc"])
 
-            # (Optional) track average over seen tasks
-            seen_accs = self.evaluate_seen_tasks(t)
-            avg_seen = float(np.mean(seen_accs))
-            print(f"[Task {t}] current task acc={res['acc']:.2f} | avg over seen tasks={avg_seen:.2f}")
+            seen = self.evaluate_seen_tasks(t)
+            avg_seen = float(np.mean(seen))
+            print(f"[Task {t}] current acc={res['acc']:.2f} | avg over seen={avg_seen:.2f}")
 
-        # Final average accuracy across all tasks' test sets
         all_accs = self.evaluate_seen_tasks(self.data_manager.num_tasks - 1)
         final_avg = float(np.mean(all_accs))
         print(f"\n[FINAL] Average accuracy over all {self.data_manager.num_tasks} tasks: {final_avg:.3f}%")
@@ -299,17 +276,12 @@ class ContinualTrainer:
         os.makedirs(output_dir, exist_ok=True)
         with open(os.path.join(output_dir, "results.json"), "w") as f:
             json.dump(self.results, f, indent=2)
-        # If drift exists, save separately for plotting
         if "drift" in self.results:
             with open(os.path.join(output_dir, "drift.json"), "w") as f:
                 json.dump(self.results["drift"], f, indent=2)
 
 
-# -----------------------
-# Entry point
-# -----------------------
 def main():
-    """Main training entrypoint."""
     parser = argparse.ArgumentParser(description="MEO/EWC Continual Learning Training")
     parser.add_argument("--config", type=str, required=True, help="Path to configuration YAML file")
     parser.add_argument("--output_dir", type=str, default="./results", help="Output directory for results")
@@ -319,18 +291,13 @@ def main():
     results = trainer.run_experiment()
     trainer.save_results(args.output_dir)
 
-    # === Aggregator-friendly JSON log for scripts/aggregate_results.py ===
-    # Determine method & seed from config (and EWC lambda if applicable)
+    # Aggregator-friendly JSON
     method_cfg = trainer.config.get("method", {})
-    if isinstance(method_cfg, str):
-        method = method_cfg.lower()
-        method_cfg = {"type": method}
-    else:
-        method = str(method_cfg.get("type", "finetune")).lower()
+    method = method_cfg if isinstance(method_cfg, str) else str(method_cfg.get("type", "finetune")).lower()
     seed = int(trainer.config.get("seed", 42))
 
     ewc_lambda = None
-    if method == "ewc":
+    if method == "ewc" and isinstance(method_cfg, dict):
         for k in ("lambda_ewc", "lambda", "lam", "ewc_lambda"):
             if k in method_cfg and method_cfg[k] is not None:
                 try:
@@ -350,12 +317,7 @@ def main():
     out_json = os.path.join(logdir, f"{tag}.json")
     with open(out_json, "w") as f:
         json.dump(
-            {
-                "method": method,
-                "lambda": ewc_lambda,
-                "seed": seed,
-                "final_avg_acc": final_avg_acc,
-            },
+            {"method": method, "lambda": ewc_lambda, "seed": seed, "final_avg_acc": final_avg_acc},
             f,
             indent=2,
         )

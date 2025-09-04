@@ -1,0 +1,6 @@
+{
+  "method": "ewc",
+  "lambda": 30,
+  "seed": 42,
+  "final_avg_acc": 6.21
+}
