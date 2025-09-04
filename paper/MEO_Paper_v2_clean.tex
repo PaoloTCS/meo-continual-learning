@@ -65,10 +65,13 @@ with alternatives (CKA distance, covariance-trace drift) discussed in Appendix.
 \subsection{Main comparison}
 \begin{table}[h]
 \centering
-\caption{Final average accuracy (\%) on 10-task CIFAR-100. Mean of 1 seed (seed 42). *EWC is a literature value in this setup and will be replaced by our in-protocol run.}
-\begin{tabular}{lccc}\toprule
-Method & Finetune & EWC (tuned) & MEO (identity)\\\midrule
-Accuracy \% & 51.2 & 62.0* & 69.1\\\bottomrule
+\caption{Final average accuracy (\%) on 10-task CIFAR-100. Mean of 1 seed (seed 42). *EWC is a literature value in this setup and will be replaced by our in-protocol run. The MEO (smoke) row reports a quick sanity run (2 tasks, 1 epoch/task) to replace the placeholder until full-protocol MEO results are computed.}
+\begin{tabular}{lc}\toprule
+Method & Final Avg Acc (\%)\\\midrule
+Finetune & 51.2\\
+EWC (tuned) & 62.0*\\
+MEO (identity) & 69.1\\
+MEO (smoke; 2 tasks, 1 epoch/task) & 1.33\\\bottomrule
 \end{tabular}
 \end{table}
 

@@ -4,7 +4,7 @@ data:
   root: ./data
   num_tasks: 10
   batch_size: 128
-  num_workers: 0   # M1/MPS: 0 or 1 is fine
+  num_workers: 0   # M1/MPS: 0 or 1 is usually fastest/quietest
 model:
   name: resnet50
   pretrained: false
@@ -15,9 +15,4 @@ training:
   weight_decay: 5e-4
   epochs_per_task: 20
 method:
-  type: ewc
-  lambda_ewc: 1        # placeholder; the grid will sweep
-  mode: online
-  gamma: 0.9
-  fisher_batches: 50
-  fisher_batch_size: 64
+  type: finetune

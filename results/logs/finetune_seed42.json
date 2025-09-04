@@ -1,0 +1,6 @@
+{
+  "method": "finetune",
+  "lambda": null,
+  "seed": 42,
+  "final_avg_acc": 6.279999999999999
+}

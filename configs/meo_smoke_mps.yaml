@@ -1,0 +1,30 @@
+seed: 42
+model:
+  name: "resnet50"
+  pretrained: false
+  num_classes: 100
+
+data:
+  root: "./data"
+  num_tasks: 2
+  batch_size: 32
+  num_workers: 2
+
+method:
+  type: "meo"
+  alpha: 0.1
+  evolution: "identity"  # or "ema"
+
+training:
+  epochs_per_task: 1
+  lr: 0.01
+  momentum: 0.9
+  weight_decay: 5e-4
+  scheduler: "cosine"
+
+device: "mps"
+
+
+
+
+

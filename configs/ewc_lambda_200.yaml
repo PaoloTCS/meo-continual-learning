@@ -1,0 +1,28 @@
+seed: 42
+model:
+  name: "resnet50"
+  pretrained: false
+  num_classes: 100
+
+data:
+  root: "./data"
+  num_tasks: 10
+  batch_size: 128
+  num_workers: 4
+
+method:
+  type: "ewc"
+  lambda_ewc: 200
+  gamma: 0.9
+  mode: "online"
+  fisher_batches: 200
+  fisher_batch_size: 128
+
+training:
+  epochs_per_task: 20
+  lr: 0.01
+  momentum: 0.9
+  weight_decay: 5e-4
+  scheduler: "cosine"
+
+device: "mps"

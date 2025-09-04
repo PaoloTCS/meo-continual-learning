@@ -1,153 +1,78 @@
-"""
-Elastic Weight Consolidation (EWC) implementation for continual learning.
-
-This module provides EWC as a baseline comparison method for MEOs.
-"""
-
+from __future__ import annotations
+from typing import Dict
 import torch
 import torch.nn as nn
-from typing import Dict, List, Optional
-import numpy as np
-
 
 class EWC:
-    """Elastic Weight Consolidation implementation."""
-    
-    def __init__(self, lambda_: float = 100.0, gamma: float = 0.9, mode: str = "online"):
-        """
-        Initialize EWC.
-        
-        Args:
-            lambda_: EWC regularization strength
-            gamma: Fisher update momentum (for online mode)
-            mode: EWC mode ('online' or 'offline')
-        """
-        self.lambda_ = lambda_
-        self.gamma = gamma
+    """
+    Online EWC with normalized Fisher:
+      F_t = gamma * F_{t-1} + F_batch_avg
+      penalty = 0.5 * lambda * sum_n F[n] * (theta_n - theta*_n)^2
+    """
+    def __init__(self, lambda_: float, gamma: float = 0.9, mode: str = "online"):
+        self.lambda_ = float(lambda_)
+        self.gamma = float(gamma)
         self.mode = mode
-        self.fisher_info = {}
-        self.optimal_params = {}
-        self.consolidated_fisher = {}
-        
-    def update_fisher(self, model: nn.Module, dataloader, device: torch.device, batches: int = 200):
-        """
-        Update Fisher Information Matrix (diagonal approximation).
-        
-        Args:
-            model: Neural network model
-            dataloader: DataLoader for computing Fisher information
-            device: Device to use for computation
-            batches: Number of batches to use for estimation
-        """
+        self.means: Dict[str, torch.Tensor] = {}
+        self.F: Dict[str, torch.Tensor] = {}
+
+    @torch.no_grad()
+    def save_optimal_params(self, model: nn.Module) -> None:
+        self.means = {n: p.detach().clone() for n, p in model.named_parameters() if p.requires_grad}
+
+    # NOTE: DO NOT decorate with @torch.no_grad() — we need autograd here.
+    def update_fisher(self, model: nn.Module, dataloader, device: torch.device,
+                      batches: int = 200) -> None:
         model.eval()
-        fisher_info = {}
-        
-        # Initialize Fisher info
-        for name, param in model.named_parameters():
-            if param.requires_grad:
-                fisher_info[name] = torch.zeros_like(param.data)
-                
-        # Compute Fisher information
-        batch_count = 0
-        for batch_idx, (data, target) in enumerate(dataloader):
-            if batch_count >= batches:
-                break
-                
-            data, target = data.to(device), target.to(device)
-            model.zero_grad()
-            
-            # Forward pass
-            output = model(data)
-            loss = nn.CrossEntropyLoss()(output, target)
-            
-            # Backward pass to get gradients
-            loss.backward()
-            
-            # Accumulate squared gradients (Fisher information)
-            for name, param in model.named_parameters():
-                if param.requires_grad and param.grad is not None:
-                    fisher_info[name] += param.grad.data ** 2
-                    
-            batch_count += 1
-            
-        # Average Fisher information
-        for name in fisher_info:
-            fisher_info[name] /= max(batch_count, 1)
-            
-        # Update consolidated Fisher (online mode)
-        if self.mode == "online":
-            if not self.consolidated_fisher:
-                self.consolidated_fisher = fisher_info
-            else:
-                for name in fisher_info:
-                    if name in self.consolidated_fisher:
-                        self.consolidated_fisher[name] = (
-                            self.gamma * self.consolidated_fisher[name] + 
-                            (1 - self.gamma) * fisher_info[name]
-                        )
+        ce = nn.CrossEntropyLoss()
+        F_accum: Dict[str, torch.Tensor] = {}
+        n_seen = 0
+
+        it = iter(dataloader)
+        # ensure grads are enabled even if outer context disabled them
+        with torch.enable_grad():
+            for _ in range(batches):
+                try:
+                    x, y = next(it)
+                except StopIteration:
+                    break
+                x, y = x.to(device), y.to(device)
+
+                model.zero_grad(set_to_none=True)
+                logits = model(x)
+                loss = ce(logits, y)
+                loss.backward()
+
+                for n, p in model.named_parameters():
+                    if not p.requires_grad or (p.grad is None):
+                        continue
+                    g2 = p.grad.detach() ** 2
+                    if n not in F_accum:
+                        F_accum[n] = g2.clone()
                     else:
-                        self.consolidated_fisher[name] = fisher_info[name]
-        else:
-            # Offline mode: replace
-            self.consolidated_fisher = fisher_info
-        
-    def save_optimal_params(self, model: nn.Module):
-        """Save current model parameters as optimal for EWC penalty."""
-        self.optimal_params = {}
-        for name, param in model.named_parameters():
-            if param.requires_grad:
-                self.optimal_params[name] = param.data.clone()
-                
+                        F_accum[n] += g2
+                n_seen += y.numel()
+
+        if n_seen == 0:
+            return
+
+        # normalize by number of samples to stabilize scale
+        for n in F_accum:
+            F_accum[n] /= float(n_seen)
+
+        # online update
+        for n, Fi in F_accum.items():
+            if n in self.F:
+                self.F[n] = self.gamma * self.F[n] + Fi
+            else:
+                self.F[n] = Fi.clone()
+
     def compute_ewc_loss(self, model: nn.Module) -> torch.Tensor:
-        """
-        Compute EWC regularization loss.
-        
-        Args:
-            model: Neural network model
-            
-        Returns:
-            EWC penalty term
-        """
-        if not self.consolidated_fisher or not self.optimal_params:
+        # no penalty before first consolidation
+        if not self.means or not self.F:
             return torch.tensor(0.0, device=next(model.parameters()).device)
-            
-        ewc_loss = 0.0
-        for name, param in model.named_parameters():
-            if param.requires_grad and name in self.consolidated_fisher:
-                fisher = self.consolidated_fisher[name]
-                optimal = self.optimal_params[name]
-                ewc_loss += torch.sum(fisher * (param - optimal) ** 2)
-                
-        return 0.5 * self.lambda_ * ewc_loss
-
-
-# Example usage
-if __name__ == "__main__":
-    # Simple example with a small model
-    model = nn.Sequential(
-        nn.Linear(784, 128),
-        nn.ReLU(),
-        nn.Linear(128, 10)
-    )
-    
-    ewc = EWC(lambda_=100.0, gamma=0.9, mode="online")
-    
-    # Simulate some data
-    dummy_data = torch.randn(100, 784)
-    dummy_targets = torch.randint(0, 10, (100,))
-    
-    # Create a simple dataloader
-    from torch.utils.data import DataLoader, TensorDataset
-    dataset = TensorDataset(dummy_data, dummy_targets)
-    dataloader = DataLoader(dataset, batch_size=32)
-    
-    # Update Fisher information
-    device = torch.device('cpu')
-    ewc.update_fisher(model, dataloader, device, batches=3)
-    
-    # Save optimal parameters
-    ewc.save_optimal_params(model)
-    
-    # Compute EWC loss
-    ewc_loss = ewc.compute_ewc_loss(model)
-    print(f"EWC loss: {ewc_loss.item():.4f}")
+        pen = torch.zeros((), device=next(model.parameters()).device)
+        for n, p in model.named_parameters():
+            if n in self.means and n in self.F:
+                pen = pen + (self.F[n] * (p - self.means[n]).pow(2)).sum()
+        return 0.5 * self.lambda_ * pen
