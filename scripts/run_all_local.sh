@@ -10,8 +10,11 @@ if [ ! -d .venv ]; then
 fi
 source .venv/bin/activate
 python -m pip install -U pip wheel setuptools
+# requirements.txt may be absent; ignore if missing
 pip install -r requirements.txt || true
-pip install pyyaml
+# Core deps for training on macOS (MPS supported wheels)
+python -m pip install -U torch torchvision torchaudio -f https://download.pytorch.org/whl/torch_stable.html
+python -m pip install -U pyyaml numpy matplotlib tqdm
 
 # --- sanity: MPS present? ---
 python - <<'PY'
@@ -29,11 +32,12 @@ mkdir -p results/logs logs
   --output_dir results/finetune_full | tee logs/finetune_full.log
 
 # ------------------------------------
-# B) EWC sweep (10 epochs) -> aggregate
+# B) EWC sweep (EPOCHS per task) -> aggregate
 # ------------------------------------
 export SEED=42
 export LAMBDAS="0.03 0.1 0.3 1 3 10 30"
-export EPOCHS=10
+# Default epochs per task for sweep (override via env)
+: "${EPOCHS:=10}"
 bash scripts/run_ewc_grid.sh | tee logs/ewc_grid_10E.log
 
 # summarize sweep
